@@ -39,6 +39,7 @@ from exceptions import (
     TrueLayer2FireflyTimeoutError,
 )
 from importer2firefly import Import2Firefly
+import httpx
 
 logging.basicConfig(
     level=logging.INFO,
@@ -278,34 +279,74 @@ async def truelayer_configuration(
     return RedirectResponse(str(auth_url), status_code=302)
 
 
-@app.get("/truelayer/get-access-token", name="truelayer/get-access-token")
-async def get_access_token(
-    request: Request, truelayer: TrueLayerClient = Depends(get_truelayer_client)
-):
-    """Get the access token from TrueLayer."""
-    await truelayer.exchange_authorization_code()
-    _LOGGER.info("Access token successfully retrieved.")
-
-    return RedirectResponse(
-        str(request.url_for("index")),
-        status_code=302,
-    )
-
-
 @app.get("/truelayer/callback")
-async def callback(request: Request) -> None:
-    """Handle the callback from TrueLayer."""
+async def callback(
+    request: Request, 
+    truelayer: TrueLayerClient = Depends(get_truelayer_client)
+):
+    """Handle the callback and exchange code for tokens immediately."""
     code = request.query_params.get("code")
     scope = request.query_params.get("scope")
+    error = request.query_params.get("error")
+
+    if error:
+        _LOGGER.error("TrueLayer returned callback error: %s", error)
+        raise HTTPException(status_code=400, detail=f"TrueLayer error: {error}")
+
+    if not code:
+        _LOGGER.error("Callback missing authorization code parameter")
+        raise HTTPException(status_code=400, detail="Missing authorization code")
 
     _LOGGER.info("Received code: %s and scope: %s", code, scope)
     config.set("truelayer_code", code)
     config.set("truelayer_scope", scope)
 
-    return RedirectResponse(
-        str(request.url_for("truelayer/get-access-token")),
-        status_code=302,
-    )
+    # 1. Reconstruct the exact HTTPS redirect URI
+    host = request.headers.get("X-Forwarded-Host", request.headers.get("Host"))
+    scheme = request.headers.get("X-Forwarded-Proto", "https")  # Force secure protocol
+    dynamic_redirect_uri = f"{scheme}://{host}/truelayer/callback"
+    
+    _LOGGER.info("Exchanging token immediately via direct POST to TrueLayer with URI: %s", dynamic_redirect_uri)
+
+    # 2. Build the exact form-encoded payload TrueLayer requires
+    token_url = "https://auth.truelayer.com/connect/token"
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": config.get("truelayer_client_id"),
+        "client_secret": config.get("truelayer_client_secret"),
+        "redirect_uri": dynamic_redirect_uri,
+        "code": code
+    }
+
+    # 3. Use an isolated HTTPX client to guarantee the request format
+    async with httpx.AsyncClient() as client:
+        try:
+            # CRITICAL: data= forces application/x-www-form-urlencoded format
+            response = await client.post(token_url, data=payload)
+            
+            if response.status_code != 200:
+                _LOGGER.error("TrueLayer direct exchange failed (%s): %s", response.status_code, response.text)
+                raise HTTPException(status_code=400, detail=f"Token exchange failed: {response.text}")
+            
+            tokens = response.json()
+            _LOGGER.info("Tokens successfully exchanged directly!")
+
+            # 4. Feed the tokens into your app's existing client state 
+            truelayer.access_token = tokens.get("access_token")
+            truelayer.refresh_token = tokens.get("refresh_token")
+            
+            # Save them to your configuration backend
+            config.set("truelayer_access_token", tokens.get("access_token"))
+            config.set("truelayer_refresh_token", tokens.get("refresh_token"))
+            
+            return RedirectResponse(
+                str(request.url_for("index")),
+                status_code=302,
+            )
+
+        except httpx.HTTPError as exc:
+            _LOGGER.error("Network error during direct token exchange: %s", str(exc))
+            raise HTTPException(status_code=502, detail="Upstream connection failed during token exchange.")
 
 
 @app.get("/truelayer/healthcheck")
@@ -412,3 +453,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=3000,
         forwarded_allow_ips=allowed_ips
+    )
