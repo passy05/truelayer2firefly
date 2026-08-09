@@ -13,9 +13,15 @@ class Config:
     """Configuration class for Plaid2Firefly"""
 
     def __init__(self) -> None:
-        self.path = Path("data/config.json")
+        # 1. Dynamically compute the absolute parent path where config.py resides
+        # This forces the path to lock onto /home/appuser/app/data/config.json across all threads
+        base_dir = Path(__file__).resolve().parent
+        self.path = base_dir / "data" / "config.json"
+
         if not self.path.exists():
             _LOGGER.info("Creating configuration file at %s", self.path)
+            # Create the data folder structure if it doesn't exist inside the workspace
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text("{}", encoding="utf-8")
         self._load()
 

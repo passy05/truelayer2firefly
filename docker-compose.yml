@@ -6,4 +6,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ./data:/app/data
+      - ./data:/home/appuser/app/data
+    environment:
+      - CONFIG_FILE_PATH=/home/appuser/app/data/config.json
+    restart: unless-stopped
