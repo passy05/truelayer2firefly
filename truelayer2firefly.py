@@ -399,3 +399,16 @@ app.add_exception_handler(
 )
 app.add_exception_handler(TrueLayer2FireflyError, truelayer_error_handler)
 app.add_exception_handler(Exception, generic_exception_handler)
+
+if __name__ == "__main__":
+    import uvicorn
+    import os
+
+    # Reads custom proxy settings or falls back to '*'
+    allowed_ips = os.getenv("FORWARDED_ALLOW_IPS", "*")
+
+    uvicorn.run(
+        "truelayer2firefly:app",
+        host="0.0.0.0",
+        port=3000,
+        forwarded_allow_ips=allowed_ips
