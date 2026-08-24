@@ -275,19 +275,112 @@ class TrueLayerClient:
         self._config.set("truelayer_credentials_id", decoded["sub"])
         self._config.set("truelayer_expiration_date", decoded["exp"])
 
-    async def get_accounts(self) -> dict[str, Any]:
+    async def get_accounts(self) -> Any:
         """Get the accounts from TrueLayer."""
-        return await self._request(
-            uri="accounts",
-            method="GET",
-        )
+        try:
+            return await self._request(
+                uri="accounts",
+                method="GET",
+            )
+        except TrueLayer2FireflyConnectionError as err:
+            if "501" in str(err) or "endpoint_not_supported" in str(err):
+                _LOGGER.info("Provider does not support /accounts endpoint (e.g. Amex). Skipping.")
+                
+                # Create a valid httpx Response object with a 200 status and empty array
+                return httpx.Response(
+                    status_code=200, 
+                    json={"results": []}
+                )
+            raise err
 
-    async def get_transactions(self, account_id: str) -> dict[str, Any]:
+    async def get_transactions(self, account_id: str) -> Any:
         """Get the transactions from TrueLayer."""
         return await self._request(
             uri=f"accounts/{account_id}/transactions",
             method="GET",
         )
+
+    async def get_cards(self) -> Any:
+        """Get the cards from TrueLayer."""
+        try:
+            return await self._request(
+                uri="cards",
+                method="GET",
+            )
+        except TrueLayer2FireflyConnectionError as err:
+            if "501" in str(err) or "endpoint_not_supported" in str(err):
+                _LOGGER.info("Provider does not support /cards endpoint. Skipping.")
+                
+                return httpx.Response(
+                    status_code=200, 
+                    json={"results": []}
+                )
+            raise err
+
+    async def get_card_transactions(self, card_id: str) -> Any:
+        """Get the card transactions from TrueLayer."""
+        return await self._request(
+            uri=f"cards/{card_id}/transactions",
+            method="GET",
+        )
+
+    async def get_accounts_and_cards(self) -> list[dict[str, Any]]:
+        """Fetch accounts and cards from TrueLayer, combining both endpoints.
+
+        Gracefully handles providers that only support one endpoint (e.g. AMEX
+        card-only providers that return an error on /accounts).  Each returned
+        entity is the raw API object with an extra ``kind`` key set to either
+        ``"account"`` or ``"card"``.
+
+        Raises :class:`TrueLayer2FireflyConnectionError` if **both** endpoints
+        fail.
+        """
+        results: list[dict[str, Any]] = []
+        accounts_error: Exception | None = None
+        cards_error: Exception | None = None
+
+        try:
+            response = await self.get_accounts()
+            data = response.json()
+            for item in data.get("results", []):
+                item["kind"] = "account"
+                results.append(item)
+            _LOGGER.info(
+                "Fetched %d account(s) from TrueLayer", len(data.get("results", []))
+            )
+        except TrueLayer2FireflyConnectionError as err:
+            _LOGGER.warning(
+                "Failed to fetch accounts from TrueLayer (may be unsupported): %s", err
+            )
+            accounts_error = err
+
+        try:
+            response = await self.get_cards()
+            data = response.json()
+            for item in data.get("results", []):
+                item["kind"] = "card"
+                results.append(item)
+            _LOGGER.info(
+                "Fetched %d card(s) from TrueLayer", len(data.get("results", []))
+            )
+        except TrueLayer2FireflyConnectionError as err:
+            _LOGGER.warning(
+                "Failed to fetch cards from TrueLayer (may be unsupported): %s", err
+            )
+            cards_error = err
+
+        # FIX 1: Only fail if BOTH endpoints completely blew up
+        if accounts_error and cards_error:
+            msg = "Both /accounts and /cards endpoints failed for this provider"
+            raise TrueLayer2FireflyConnectionError(msg) from accounts_error
+
+        # FIX 2: If we didn't get any accounts OR cards, raise an error so the
+        # healthcheck knows we don't have anything to sync yet.
+        if not results:
+            msg = "No accounts or cards were found. Check your TrueLayer account scopes."
+            raise TrueLayer2FireflyConnectionError(msg)
+
+        return results
 
     async def close(self) -> None:
         """Close the HTTPX client session."""
